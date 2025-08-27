@@ -25,9 +25,13 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
 
     ctx = moderngl.create_standalone_context()
     logger.info(f'Using GPU: {ctx.info["GL_RENDERER"]}; {ctx.info["GL_VENDOR"]}; {ctx.info["GL_VERSION"]}')
-    logger.info(f'Maximum texture size: {ctx.info["GL_MAX_TEXTURE_SIZE"]}x{ctx.info["GL_MAX_TEXTURE_SIZE"]}')
 
-    max_texture_size = ctx.info['GL_MAX_TEXTURE_SIZE']
+    # Ensure we have enough VRAM for two tiles. There's no generic way of getting maximum VRAM, so we assume that the maximum texture
+    # is the same size as the maximum VRAM. Because we divide both dimensions by two, we should only use at most half the VRAM. This
+    # could possibly be made better by using extensions GL_NVX_gpu_memory_info or GL_ATI_meminfo, then falling back to this naieve
+    # version for GPUs that don't support those extensions.
+    max_tile_size = ctx.info['GL_MAX_TEXTURE_SIZE'] // 2
+    logger.info(f"Maximum tile size: {ctx.info['GL_MAX_TEXTURE_SIZE']}x{ctx.info['GL_MAX_TEXTURE_SIZE']}")
 
     with open("algorithms/slope.glsl", "rt") as f:
         compute_shader = ctx.compute_shader(source=f.read())
@@ -36,15 +40,17 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
         logger.info(f"Loading \"{input_file_path}\" @ {src.width}x{src.height}")
 
         # Get some basic input file info and use the largest texture size this GPU can deal with
-        # to split the file into chunks.
+        # to split the file into tiles.
         img_width = src.width
         img_height = src.height
-        chunk_width = min(img_width, max_texture_size - 2)
-        chunk_height = min(img_height, max_texture_size - 2)
-        workgroups_x = (chunk_width + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
-        workgroups_y = (chunk_height + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+        tile_width = min(img_width, max_tile_size - 2)
+        tile_height = min(img_height, max_tile_size - 2)
+        workgroups_x = (tile_width + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+        workgroups_y = (tile_height + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+        tiles_x = (img_width + tile_width - 1) // tile_width
+        tiles_y = (img_height + tile_height - 1) // tile_height
 
-        logger.info(f"Chunk size: {chunk_width}x{chunk_height}")
+        logger.info(f"tile size: {tile_width}x{tile_height}")
 
         dst_profile = src.profile
         dst_profile.update({
@@ -53,27 +59,31 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
             "compress": "lzw"
         })
 
+        nodata = -32767.0 if src.nodata is None else src.nodata
+
         # Create appropriately-sized buffers on the GPU and the CPU.
-        gpu_buf_in = ctx.texture((chunk_width + 2, chunk_height + 2), components=1, dtype='f4')
+        gpu_buf_in = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
         gpu_buf_in.bind_to_image(0, read=True, write=False)
-        gpu_buf_out = ctx.texture((chunk_width + 2, chunk_height + 2), components=1, dtype='f4')
+        gpu_buf_out = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
         gpu_buf_out.bind_to_image(1, read=False, write=True)
-        cpu_buf_in = np.full((chunk_height + 2, chunk_width + 2), src.nodata, dtype=np.float32)
+        cpu_buf_in = np.full((tile_height + 2, tile_width + 2), nodata, dtype=np.float32)
+
+        logger.info(f"Writing {tiles_x}x{tiles_y} tiles to {output_file_path}")
 
         with rasterio.open(output_file_path, "w", **dst_profile) as dst:
-            for y0 in range(0, img_height, chunk_height):
-                for x0 in range(0, img_width, chunk_width):
-                    logger.info(f"Processing chunk {x0}:{y0}")
+            for y0 in range(0, img_height, tile_height):
+                for x0 in range(0, img_width, tile_width):
+                    logger.info(f"Processing tile {x0 // tile_width}:{y0 // tile_height}")
 
                     # Compute actual tile size (may be truncated at edges)
-                    tile_w = min(chunk_width, img_width - x0)
-                    tile_h = min(chunk_height, img_height - y0)
+                    actual_tile_width = min(tile_width, img_width - x0)
+                    actual_tile_height = min(tile_height, img_height - y0)
 
                     # Add 1-pixel overlap if possible
                     read_x0 = max(x0 - 1, 0)
                     read_y0 = max(y0 - 1, 0)
-                    read_x1 = min(x0 + tile_w + 1, img_width)
-                    read_y1 = min(y0 + tile_h + 1, img_height)
+                    read_x1 = min(x0 + actual_tile_width + 1, img_width)
+                    read_y1 = min(y0 + actual_tile_height + 1, img_height)
 
                     read_w = read_x1 - read_x0
                     read_h = read_y1 - read_y0
@@ -83,12 +93,12 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
 
                     window = Window(read_x0, read_y0, read_w, read_h)
                     arr = cpu_buf_in[pad_t:read_h + pad_t, pad_l:read_w + pad_l]
-                    arr[:, :] = src.nodata
+                    arr[:, :] = nodata
                     src.read(input_band, window=window, out=arr)
 
                     gpu_buf_in.write(data=cpu_buf_in.tobytes())
 
-                    compute_shader["no_data"] = src.nodata
+                    compute_shader["no_data"] = nodata
 
                     # Assumes no z-rotation.
                     compute_shader["texel_size"] = [abs(src.transform.a), abs(src.transform.e)]
@@ -98,9 +108,9 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
                     ctx.finish()
 
                     logger.info(f"Writing result to {output_file_path}")
-                    result = np.frombuffer(gpu_buf_out.read(), dtype=np.float32).reshape(chunk_height + 2, chunk_width + 2)
-                    result = result[1:tile_h + 1, 1:tile_w + 1]
-                    write_window = Window(x0, y0, tile_w, tile_h)
+                    result = np.frombuffer(gpu_buf_out.read(), dtype=np.float32).reshape(tile_height + 2, tile_width + 2)
+                    result = result[1:actual_tile_height + 1, 1:actual_tile_width + 1]
+                    write_window = Window(x0, y0, actual_tile_width, actual_tile_height)
                     dst.write(result, 1, window=write_window)
 
     logger.info("Done")
