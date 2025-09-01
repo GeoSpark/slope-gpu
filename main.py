@@ -9,7 +9,19 @@ from loguru import logger
 
 compute_shader_workgroup_size = 8
 
-@click.command
+@click.group()
+def cli():
+    pass
+
+
+@click.command(name="info")
+def info():
+    ctx = moderngl.create_standalone_context()
+    logger.info(f'Using GPU: {ctx.info["GL_RENDERER"]}; {ctx.info["GL_VENDOR"]}; {ctx.info["GL_VERSION"]}')
+    logger.info(f"Maximum tile size: {ctx.info['GL_MAX_TEXTURE_SIZE']}x{ctx.info['GL_MAX_TEXTURE_SIZE']}")
+
+
+@click.command(name="slope")
 @click.argument("input_file_path", type=click.Path(exists=True, path_type=Path))
 @click.argument("output_file_path", type=click.Path(path_type=Path))
 @click.option("--input-band", type=int, default=1, help="Band to read from input file. Default: 1")
@@ -117,4 +129,6 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
 
 
 if __name__ == "__main__":
-    slope()
+    cli.add_command(info)
+    cli.add_command(slope)
+    cli()
