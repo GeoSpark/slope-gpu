@@ -16,7 +16,7 @@ def cli():
 
 @click.command(name="info")
 def info():
-    ctx = moderngl.create_standalone_context()
+    ctx = moderngl.create_standalone_context(backend="egl")  # noqa
     logger.info(f'Using GPU: {ctx.info["GL_RENDERER"]}; {ctx.info["GL_VENDOR"]}; {ctx.info["GL_VERSION"]}')
     logger.info(f"Maximum tile size: {ctx.info['GL_MAX_TEXTURE_SIZE']}x{ctx.info['GL_MAX_TEXTURE_SIZE']}")
 
@@ -32,10 +32,9 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
             logger.warning(f"Output file \"{output_file_path}\" already exists, overwriting.")
             output_file_path.unlink()
         else:
-            ctx = click.get_current_context()
-            ctx.fail(f"Output file \"{output_file_path}\" already exists, exiting.")
+            click.get_current_context().fail(f"Output file \"{output_file_path}\" already exists, exiting.")
 
-    ctx = moderngl.create_standalone_context()
+    ctx = moderngl.create_standalone_context(backend="egl")  # noqa
     logger.info(f'Using GPU: {ctx.info["GL_RENDERER"]}; {ctx.info["GL_VENDOR"]}; {ctx.info["GL_VERSION"]}')
 
     # Ensure we have enough VRAM for two tiles. There's no generic way of getting maximum VRAM, so we assume that the maximum texture
