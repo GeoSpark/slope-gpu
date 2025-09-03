@@ -47,6 +47,18 @@ def calc_slope(input_file_path: Path, output_file_path: Path, input_band: int = 
     with open("algorithms/threshold.glsl", "rt") as f:
         threshold_shader = ctx.compute_shader(source=f.read())
 
+    with open("algorithms/median_filter.glsl", "rt") as f:
+        median_filter_shader = ctx.compute_shader(source=f.read())
+
+    with open("algorithms/dilation_filter.glsl", "rt") as f:
+        dilation_filter_shader = ctx.compute_shader(source=f.read())
+
+    with open("algorithms/erosion_filter.glsl", "rt") as f:
+        erosion_filter_shader = ctx.compute_shader(source=f.read())
+
+    with open("algorithms/mask_zeros.glsl", "rt") as f:
+        mask_zeros_shader = ctx.compute_shader(source=f.read())
+
     src, mask = get_polygons(input_file_path)
     # Get some basic input file info and use the largest texture size this GPU can deal with
     # to split the file into tiles.
@@ -128,6 +140,42 @@ def calc_slope(input_file_path: Path, output_file_path: Path, input_band: int = 
                 threshold_shader["no_data"] = nodata
                 threshold_shader["threshold"] = 10.0
                 threshold_shader.run(workgroups_x, workgroups_y, 1)
+                ctx.finish()
+                ctx.memory_barrier()
+                # ----------------
+                logger.info(f"Median filter")
+                # Swap buffers.
+                gpu_buf_a.bind_to_image(0, read=True, write=False)
+                gpu_buf_b.bind_to_image(1, read=False, write=True)
+                median_filter_shader["no_data"] = nodata
+                median_filter_shader.run(workgroups_x, workgroups_y, 1)
+                ctx.finish()
+                ctx.memory_barrier()
+                # ----------------
+                logger.info(f"Closing (Erode filter)")
+                # Swap buffers.
+                gpu_buf_b.bind_to_image(0, read=True, write=False)
+                gpu_buf_a.bind_to_image(1, read=False, write=True)
+                dilation_filter_shader["no_data"] = nodata
+                dilation_filter_shader.run(workgroups_x, workgroups_y, 1)
+                ctx.finish()
+                ctx.memory_barrier()
+                # ----------------
+                logger.info(f"Closing (Dilation filter)")
+                # Swap buffers.
+                gpu_buf_a.bind_to_image(0, read=True, write=False)
+                gpu_buf_b.bind_to_image(1, read=False, write=True)
+                erosion_filter_shader["no_data"] = nodata
+                erosion_filter_shader.run(workgroups_x, workgroups_y, 1)
+                ctx.finish()
+                ctx.memory_barrier()
+                # ----------------
+                logger.info(f"Masking zeros")
+                # Swap buffers.
+                gpu_buf_b.bind_to_image(0, read=True, write=False)
+                gpu_buf_a.bind_to_image(1, read=False, write=True)
+                mask_zeros_shader["no_data"] = nodata
+                mask_zeros_shader.run(workgroups_x, workgroups_y, 1)
                 ctx.finish()
                 ctx.memory_barrier()
                 # ----------------

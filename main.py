@@ -132,7 +132,7 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
 
 
 if __name__ == "__main__":
-    df = calc_slope(Path("example-data/srtm.vrt"), Path("example-data/srtm_slope_threshold.tif"))
+    df = calc_slope(Path("example-data/srtm.vrt"), Path("example-data/srtm_slope_final.tif"))
     # cli.add_command(info)
     # cli.add_command(slope)
     # cli()

@@ -7,19 +7,14 @@ layout(binding = 1, r32f) uniform restrict writeonly image2D out_data;
 
 // Ignore pixels that have this value.
 uniform float no_data;
-// Slope grade threshold.
-uniform float threshold;
 
 void main() {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
 
     float val = imageLoad(in_data, gid).r;
-    if (val == no_data) {
+    if (val == no_data || val == 0.0) {
         imageStore(out_data, gid, vec4(no_data));
         return;
     }
-
-    float output_val = 1.0 - step(threshold, val);
-
-    imageStore(out_data, gid, vec4(output_val));
+    imageStore(out_data, gid, vec4(val));
 }
