@@ -1,13 +1,17 @@
 from pathlib import Path
 
 import click
+from loguru import logger
 import moderngl
 import numpy as np
 import rasterio
 from rasterio.windows import Window
-from loguru import logger
+
+from geometry import calc_slope
 
 compute_shader_workgroup_size = 8
+
+
 
 @click.group()
 def cli():
@@ -70,7 +74,7 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
             "compress": "lzw"
         })
 
-        nodata = -32767.0 if src.nodata is None else src.nodata
+        nodata = -32768.0 if src.nodata is None else src.nodata
 
         # Create appropriately-sized buffers on the GPU and the CPU.
         gpu_buf_in = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
@@ -128,6 +132,7 @@ def slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, ov
 
 
 if __name__ == "__main__":
-    cli.add_command(info)
-    cli.add_command(slope)
-    cli()
+    df = calc_slope(Path("example-data/srtm.vrt"), Path("example-data/srtm_slope_threshold.tif"))
+    # cli.add_command(info)
+    # cli.add_command(slope)
+    # cli()

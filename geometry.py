@@ -1,0 +1,216 @@
+from pathlib import Path
+import math
+import os
+
+import numpy as np
+from dotenv import load_dotenv
+import geopandas as gpd
+from loguru import logger
+import moderngl
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.features import geometry_mask
+from rasterio.transform import array_bounds, from_origin
+from rasterio.vrt import WarpedVRT
+from rasterio.warp import calculate_default_transform, transform_bounds
+from rasterio.windows import Window, from_bounds
+from sqlalchemy import create_engine
+
+load_dotenv()
+conn_str = f"postgresql+psycopg://{os.getenv("PGUSER")}:{os.getenv("PGPASSWORD")}@{os.getenv("PGHOST")}:{os.getenv("PGPORT")}/{os.getenv("PGDATABASE")}"
+engine = create_engine(conn_str)
+compute_shader_workgroup_size = 8
+
+
+def calc_slope(input_file_path: Path, output_file_path: Path, input_band: int = 1, overwrite: bool = False):
+    if output_file_path.exists():
+        if overwrite:
+            logger.warning(f"Output file \"{output_file_path}\" already exists, overwriting.")
+            output_file_path.unlink()
+        else:
+            return
+            # click.get_current_context().fail(f"Output file \"{output_file_path}\" already exists, exiting.")
+
+    ctx = moderngl.create_standalone_context(backend="egl")  # noqa
+    logger.info(f'Using GPU: {ctx.info["GL_RENDERER"]}; {ctx.info["GL_VENDOR"]}; {ctx.info["GL_VERSION"]}')
+
+    # Ensure we have enough VRAM for two tiles. There's no generic way of getting maximum VRAM, so we assume that the maximum texture
+    # is the same size as the maximum VRAM. Because we divide both dimensions by two, we should only use at most half the VRAM. This
+    # could possibly be made better by using extensions GL_NVX_gpu_memory_info or GL_ATI_meminfo, then falling back to this naieve
+    # version for GPUs that don't support those extensions.
+    max_tile_size = ctx.info['GL_MAX_TEXTURE_SIZE'] // 2
+    logger.info(f"Maximum tile size: {ctx.info['GL_MAX_TEXTURE_SIZE']}x{ctx.info['GL_MAX_TEXTURE_SIZE']}")
+
+    with open("algorithms/slope.glsl", "rt") as f:
+        slope_shader = ctx.compute_shader(source=f.read())
+
+    with open("algorithms/threshold.glsl", "rt") as f:
+        threshold_shader = ctx.compute_shader(source=f.read())
+
+    src, mask = get_polygons(input_file_path)
+    # Get some basic input file info and use the largest texture size this GPU can deal with
+    # to split the file into tiles.
+    img_width = src.width
+    img_height = src.height
+    tile_width = min(img_width, max_tile_size - 2)
+    tile_height = min(img_height, max_tile_size - 2)
+    workgroups_x = (tile_width + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+    workgroups_y = (tile_height + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+    tiles_x = (img_width + tile_width - 1) // tile_width
+    tiles_y = (img_height + tile_height - 1) // tile_height
+
+    logger.info(f"tile size: {tile_width}x{tile_height}")
+
+    nodata = -32768.0 if src.nodata is None else src.nodata
+
+    # Create appropriately-sized buffers on the GPU and the CPU.
+    gpu_buf_a = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
+    gpu_buf_b = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
+    cpu_buf = np.full((tile_height + 2, tile_width + 2), nodata, dtype=np.float32)
+
+    dst_profile = src.profile
+    dst_profile.update({
+        "driver": "GTiff",
+        "blockxsize": 256,
+        "blockysize": 256,
+        "tiled": True,
+        "count": 1,
+        "dtype": "float32",
+        "compress": "lzw"
+    })
+
+    logger.info(f"Writing {tiles_x}x{tiles_y} tiles to {output_file_path}")
+
+    with rasterio.open(output_file_path, "w", **dst_profile) as dst:
+        for y0 in range(0, img_height, tile_height):
+            for x0 in range(0, img_width, tile_width):
+                logger.info(f"Processing tile {x0 // tile_width}:{y0 // tile_height}")
+
+                # Compute actual tile size (may be truncated at edges)
+                actual_tile_width = min(tile_width, img_width - x0)
+                actual_tile_height = min(tile_height, img_height - y0)
+
+                # Add 1-pixel overlap if possible
+                read_x0 = max(x0 - 1, 0)
+                read_y0 = max(y0 - 1, 0)
+                read_x1 = min(x0 + actual_tile_width + 1, img_width)
+                read_y1 = min(y0 + actual_tile_height + 1, img_height)
+
+                read_w = read_x1 - read_x0
+                read_h = read_y1 - read_y0
+
+                pad_l = 1 if read_x0 == 0 else 0
+                pad_t = 1 if read_y0 == 0 else 0
+
+                window = Window(read_x0, read_y0, read_w, read_h)
+                arr = cpu_buf[pad_t:read_h + pad_t, pad_l:read_w + pad_l]
+                src.read(input_band, window=window, out=arr)
+                w_mask = mask[read_y0:read_y1, read_x0:read_x1]
+                arr[w_mask] = src.nodata
+
+                gpu_buf_a.write(data=cpu_buf.tobytes())
+
+                # ----------------
+                logger.info(f"Calculating slope")
+                gpu_buf_a.bind_to_image(0, read=True, write=False)
+                gpu_buf_b.bind_to_image(1, read=False, write=True)
+                slope_shader["no_data"] = nodata
+                # Assumes no z-rotation.
+                slope_shader["texel_size"] = [abs(src.transform.a), abs(src.transform.e)]
+                slope_shader.run(workgroups_x, workgroups_y, 1)
+                ctx.finish()
+                ctx.memory_barrier()
+                # ----------------
+                logger.info(f"Thresholding slope")
+                # Swap buffers.
+                gpu_buf_b.bind_to_image(0, read=True, write=False)
+                gpu_buf_a.bind_to_image(1, read=False, write=True)
+                threshold_shader["no_data"] = nodata
+                threshold_shader["threshold"] = 10.0
+                threshold_shader.run(workgroups_x, workgroups_y, 1)
+                ctx.finish()
+                ctx.memory_barrier()
+                # ----------------
+
+                logger.info(f"Writing result to {output_file_path}")
+                result = np.frombuffer(gpu_buf_a.read(), dtype=np.float32).reshape(tile_height + 2, tile_width + 2)
+                result = result[1:actual_tile_height + 1, 1:actual_tile_width + 1]
+                write_window = Window(x0, y0, actual_tile_width, actual_tile_height)
+
+                dst.write(result, 1, window=write_window)
+
+    logger.info("Done")
+
+
+def get_polygons(input_file_path: Path) -> tuple[WarpedVRT, np.ndarray]:
+    sql_mask = f'SELECT geom FROM "phase2"."land" WHERE grid_id=255 and subtype=\'land\' and class=\'land\''
+    gdf_mask = gpd.read_postgis(sql_mask, con=engine, geom_col="geom")
+
+    bounds = gdf_mask.total_bounds
+
+    with rasterio.open(input_file_path) as src:
+        logger.info(f"Loading \"{src.name}\" @ {src.width}x{src.height}")
+
+        xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bounds
+        xres, yres = suggest_resolution_from_src_window(src, gdf_mask.crs, bounds)
+
+        border_px = 1
+        xmin_pad = xmin_3832 - border_px * xres
+        xmax_pad = xmax_3832 + border_px * xres
+        ymin_pad = ymin_3832 - border_px * yres
+        ymax_pad = ymax_3832 + border_px * yres
+
+        # Build the exact target grid
+        width  = max(1, int(math.ceil((xmax_pad - xmin_pad) / xres)))
+        height = max(1, int(math.ceil((ymax_pad - ymin_pad) / yres)))
+        dst_transform = from_origin(xmin_pad, ymax_pad, xres, yres)
+
+        vrt = WarpedVRT(
+            src,
+            crs=gdf_mask.crs,
+            transform=dst_transform,
+            width=width,
+            height=height,
+            resampling=Resampling.bilinear,
+            src_nodata=src.nodata,
+            nodata=src.nodata,
+            dtype="float32",
+        )
+
+        outside_mask = geometry_mask(
+            geometries=gdf_mask.geometry,
+            out_shape=(height, width),
+            transform=dst_transform,
+            invert=False,  # False => mask=True outside the shapes
+            all_touched=True
+        )
+
+    return vrt, outside_mask
+
+def suggest_resolution_from_src_window(src, dst_crs, bbox_3832):
+    xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bbox_3832
+
+    # 1) Convert the target bbox -> source CRS
+    xmin_s, ymin_s, xmax_s, ymax_s = transform_bounds(dst_crs, src.crs,
+                                                      xmin_3832, ymin_3832, xmax_3832, ymax_3832,
+                                                      densify_pts=21)
+
+    # 2) Build a source window covering that area, then derive its exact bounds
+    win = from_bounds(xmin_s, ymin_s, xmax_s, ymax_s, src.transform).round_offsets().round_lengths()
+    w = max(1, int(win.width))
+    h = max(1, int(win.height))
+    src_win_transform = rasterio.windows.transform(win, src.transform)
+    left, bottom, right, top = array_bounds(h, w, src_win_transform)
+
+    # 3) Let GDAL pick a default target transform for *this* source window
+    dst_transform, dst_w, dst_h = calculate_default_transform(
+        src_crs=src.crs, dst_crs=dst_crs,
+        width=w, height=h,
+        left=left, bottom=bottom, right=right, top=top
+    )
+
+    # Extract pixel sizes
+    xres = abs(dst_transform.a)
+    yres = abs(dst_transform.e)
+
+    return xres, yres
