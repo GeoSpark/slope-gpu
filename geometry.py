@@ -9,7 +9,7 @@ from loguru import logger
 import moderngl
 import rasterio
 from rasterio.enums import Resampling
-from rasterio.features import geometry_mask
+from rasterio.features import geometry_mask, shapes
 from rasterio.transform import array_bounds, from_origin
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform, transform_bounds
@@ -187,7 +187,42 @@ def calc_slope(input_file_path: Path, output_file_path: Path, input_band: int = 
 
                 dst.write(result, 1, window=write_window)
 
+    with rasterio.open(output_file_path, "r") as dst:
+        logger.info("Polygonizing")
+        slope_polygons = polygonize(dst.read(1), dst.transform, src.crs, 100, smooth_m=15.0)
+        slope_polygons.to_file(Path("example-data/slope_gt10_simplified.gpkg"), driver="GPKG")
+
     logger.info("Done")
+
+
+def polygonize(mask_bool, transform, crs, min_area_m2, smooth_m=0.0):
+    feats = (
+        {"properties": {}, "geometry": geom}
+        for geom, val in shapes(mask_bool, transform=transform, connectivity=8)
+        if val == 1
+    )
+
+    gdf = gpd.GeoDataFrame.from_features(feats, crs=crs)
+
+    logger.info("Removing small polygons")
+
+    # drop tiny polygons by real area
+    if not gdf.empty:
+        gdf = gdf[gdf.geometry.area >= min_area_m2]
+
+    # logger.info("Smoothing edges")
+
+    # optional gentle smoothing (close gaps / soften stair-steps)
+    # if smooth_m and not gdf.empty:
+    #     gdf["geometry"] = gdf.buffer(smooth_m).buffer(-smooth_m)
+
+    # logger.info("Removing invalid polygons")
+
+    # fix invalids
+    # if not gdf.empty:
+    #     gdf["geometry"] = gdf.buffer(0)
+
+    return gdf
 
 
 def get_polygons(input_file_path: Path) -> tuple[WarpedVRT, np.ndarray]:
