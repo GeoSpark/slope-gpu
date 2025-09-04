@@ -21,6 +21,8 @@ load_dotenv()
 conn_str = f"postgresql+psycopg://{os.getenv("PGUSER")}:{os.getenv("PGPASSWORD")}@{os.getenv("PGHOST")}:{os.getenv("PGPORT")}/{os.getenv("PGDATABASE")}"
 engine = create_engine(conn_str)
 compute_shader_workgroup_size = 8
+overlap = 4
+halo = 1
 max_tile_size = 0
 nodata = -32768.0
 shaders = {}
@@ -39,25 +41,26 @@ def calc_slope(input_file_path: Path, output_file_path: Path, threshold: float):
         "compress": "lzw"
     }
 
-    grid_ids = [255]
+    grid_ids = [270]
 
     for grid_id in grid_ids:
         logger.info(f"Fetching grid {grid_id}")
-        src, mask = _get_polygons(input_file_path, grid_id)
-        dst_profile["height"] = src.height
-        dst_profile["width"] = src.width
-        dst_profile["crs"] = src.crs
-        dst_profile["transform"] = src.transform
 
-        with MemoryFile() as memfile:
-            with memfile.open(**dst_profile) as dst:
-                _process(ctx, dst, src, mask, threshold)
+        with _get_polygons(input_file_path, grid_id).open() as src:
+            dst_profile["height"] = src.height
+            dst_profile["width"] = src.width
+            dst_profile["crs"] = src.crs
+            dst_profile["transform"] = src.transform
 
-            with memfile.open() as dst:
-                slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
-                slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
+            with MemoryFile() as memfile:
+                with memfile.open(**dst_profile) as dst:
+                    _process(ctx, dst, src, threshold)
 
-        logger.info("Done")
+                with memfile.open() as dst:
+                    slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
+                    slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
+
+            logger.info("Done")
 
 
 def _init_moderngl():
@@ -100,52 +103,33 @@ def _init_moderngl():
     return ctx
 
 
-def _process(ctx: moderngl.Context, dst, src, mask, threshold: float):
+def _process(ctx: moderngl.Context, dst, src, threshold: float):
     # Get some basic input file info and use the largest texture size this GPU can deal with
     # to split the file into tiles.
-    img_width = src.width
-    img_height = src.height
-    tile_width = min(img_width, max_tile_size - 2)
-    tile_height = min(img_height, max_tile_size - 2)
-    workgroups_x = (tile_width + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
-    workgroups_y = (tile_height + 2 + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
-    tiles_x = (img_width + tile_width - 1) // tile_width
-    tiles_y = (img_height + tile_height - 1) // tile_height
+    # img_width = src.width
+    # img_height = src.height
+    # tile_width = max_tile_size + (2 * overlap)
+    # tile_height = max_tile_size + (2 * overlap)
+    workgroups_x = (max_tile_size + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+    workgroups_y = (max_tile_size + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
+    tiles_x = (src.width + max_tile_size - 1) // max_tile_size
+    tiles_y = (src.height + max_tile_size - 1) // max_tile_size
 
-    logger.info(f"tile size: {tile_width}x{tile_height}")
+    logger.info(f"tile size: {max_tile_size}x{max_tile_size}")
 
     # Create appropriately-sized buffers on the GPU and the CPU.
-    gpu_buf_a = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
-    gpu_buf_b = ctx.texture((tile_width + 2, tile_height + 2), components=1, dtype='f4')
-    cpu_buf = np.full((tile_height + 2, tile_width + 2), nodata, dtype=np.float32)
+    gpu_buf_a = ctx.texture((max_tile_size, max_tile_size), components=1, dtype='f4')
+    gpu_buf_b = ctx.texture((max_tile_size, max_tile_size), components=1, dtype='f4')
+    cpu_buf = np.full((max_tile_size, max_tile_size), nodata, dtype=np.float32)
 
     logger.info(f"Writing {tiles_x}x{tiles_y} tiles")
 
-    for y0 in range(0, img_height, tile_height):
-        for x0 in range(0, img_width, tile_width):
-            logger.info(f"Processing tile {x0 // tile_width}:{y0 // tile_height}")
+    for y0 in range(-overlap, src.width, max_tile_size - (overlap * 2)):
+        for x0 in range(-overlap, src.height, max_tile_size - (overlap * 2)):
+            logger.info(f"Processing tile {x0 // max_tile_size}:{y0 // max_tile_size}")
 
-            # Compute actual tile size (may be truncated at edges)
-            actual_tile_width = min(tile_width, img_width - x0)
-            actual_tile_height = min(tile_height, img_height - y0)
-
-            # Add 1-pixel overlap if possible
-            read_x0 = max(x0 - 1, 0)
-            read_y0 = max(y0 - 1, 0)
-            read_x1 = min(x0 + actual_tile_width + 1, img_width)
-            read_y1 = min(y0 + actual_tile_height + 1, img_height)
-
-            read_w = read_x1 - read_x0
-            read_h = read_y1 - read_y0
-
-            pad_l = 1 if read_x0 == 0 else 0
-            pad_t = 1 if read_y0 == 0 else 0
-
-            window = Window(read_x0, read_y0, read_w, read_h)
-            arr = cpu_buf[pad_t:read_h + pad_t, pad_l:read_w + pad_l]
-            src.read(1, window=window, out=arr)
-            w_mask = mask[read_y0:read_y1, read_x0:read_x1]
-            arr[w_mask] = src.nodata
+            window = Window(x0, y0, max_tile_size, max_tile_size)
+            src.read(1, window=window, out=cpu_buf, boundless=True, masked=True, fill_value=nodata)
 
             gpu_buf_a.write(data=cpu_buf.tobytes())
 
@@ -202,10 +186,13 @@ def _process(ctx: moderngl.Context, dst, src, mask, threshold: float):
             # ----------------
 
             logger.info(f"Storing result")
-            result = np.frombuffer(gpu_buf_a.read(), dtype=np.float32).reshape(tile_height + 2, tile_width + 2)
-            result = result[1:actual_tile_height + 1, 1:actual_tile_width + 1]
-            write_window = Window(x0, y0, actual_tile_width, actual_tile_height)
-
+            result = np.frombuffer(gpu_buf_a.read(), dtype=np.float32).reshape((max_tile_size, max_tile_size))
+            x = x0 + overlap
+            y = y0 + overlap
+            w = min(max_tile_size - overlap, src.width - x)
+            h = min(max_tile_size - overlap, src.height - y)
+            write_window = Window(x, y, w, h)
+            result = result[overlap:overlap + h, overlap:overlap + w]
             dst.write(result, 1, window=write_window)
 
 
@@ -228,7 +215,7 @@ def _polygonize(mask_bool, transform, crs, min_area_m2):
     return gdf
 
 
-def _get_polygons(input_file_path: Path, grid_id: int) -> tuple[WarpedVRT, np.ndarray]:
+def _get_polygons(input_file_path: Path, grid_id: int) -> MemoryFile:
     sql = f'SELECT geom FROM "phase2"."land" WHERE grid_id=%(grid_id)s and subtype=%(subtype)s and class=%(class)s'
     gdf_mask = gpd.read_postgis(sql, con=engine, geom_col="geom", params={"grid_id": grid_id, "subtype": "land", "class": "land"})
 
@@ -240,11 +227,10 @@ def _get_polygons(input_file_path: Path, grid_id: int) -> tuple[WarpedVRT, np.nd
         xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bounds
         xres, yres = _suggest_resolution_from_src_window(src, gdf_mask.crs, bounds)
 
-        border_px = 1
-        xmin_pad = xmin_3832 - border_px * xres
-        xmax_pad = xmax_3832 + border_px * xres
-        ymin_pad = ymin_3832 - border_px * yres
-        ymax_pad = ymax_3832 + border_px * yres
+        xmin_pad = xmin_3832 - overlap * xres
+        xmax_pad = xmax_3832 + overlap * xres
+        ymin_pad = ymin_3832 - overlap * yres
+        ymax_pad = ymax_3832 + overlap * yres
 
         # Build the exact target grid
         width  = max(1, int(math.ceil((xmax_pad - xmin_pad) / xres)))
@@ -263,7 +249,9 @@ def _get_polygons(input_file_path: Path, grid_id: int) -> tuple[WarpedVRT, np.nd
             dtype="float32",
         )
 
-        outside_mask = geometry_mask(
+        data = vrt.read(1)
+
+        mask = geometry_mask(
             geometries=gdf_mask.geometry,
             out_shape=(height, width),
             transform=dst_transform,
@@ -271,7 +259,20 @@ def _get_polygons(input_file_path: Path, grid_id: int) -> tuple[WarpedVRT, np.nd
             all_touched=True
         )
 
-    return vrt, outside_mask
+        data[mask] = src.nodata
+
+    profile = vrt.profile
+    profile["driver"] = "GTiff"
+    profile["tiled"] = True
+    profile["blockxsize"] = 256
+    profile["blockysize"] = 256
+
+    masked_data = MemoryFile()
+    with masked_data.open(**profile) as memfile:
+        memfile.write(data, 1)
+
+    return masked_data
+
 
 def _suggest_resolution_from_src_window(src, dst_crs, bbox_3832):
     xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bbox_3832
