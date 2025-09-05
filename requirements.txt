@@ -1,6 +1,6 @@
 click~=8.2.1
 loguru ~= 0.7.3
-moderngl[headless] ~= 5.12.0
+moderngl[headless] ~= 5.8.2 --only-binary=glcontext --only-binary=moderngl
 numpy ~= 2.2.6
 rasterio ~= 1.3.11
 geopandas ~= 1.1.1
