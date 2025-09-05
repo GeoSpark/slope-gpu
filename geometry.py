@@ -18,7 +18,7 @@ from rasterio.io import MemoryFile
 from sqlalchemy import create_engine, text
 
 load_dotenv()
-conn_str = f"postgresql+psycopg://{os.getenv("PGUSER")}:{os.getenv("PGPASSWORD")}@{os.getenv("PGHOST")}:{os.getenv("PGPORT")}/{os.getenv("PGDATABASE")}"
+conn_str = f'postgresql+psycopg://{os.getenv("PGUSER")}:{os.getenv("PGPASSWORD")}@{os.getenv("PGHOST")}:{os.getenv("PGPORT")}/{os.getenv("PGDATABASE")}'
 engine = create_engine(conn_str)
 compute_shader_workgroup_size = 8
 overlap = 4
