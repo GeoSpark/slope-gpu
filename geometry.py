@@ -15,7 +15,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import calculate_default_transform, transform_bounds
 from rasterio.windows import Window, from_bounds
 from rasterio.io import MemoryFile
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 load_dotenv()
 conn_str = f"postgresql+psycopg://{os.getenv("PGUSER")}:{os.getenv("PGPASSWORD")}@{os.getenv("PGHOST")}:{os.getenv("PGPORT")}/{os.getenv("PGDATABASE")}"
@@ -38,29 +38,44 @@ def calc_slope(input_file_path: Path, output_file_path: Path, threshold: float):
         "tiled": True,
         "count": 1,
         "dtype": "float32",
-        "compress": "lzw"
+        "compress": "lzw",
+        "nodata": nodata,
     }
 
-    grid_ids = [270]
+    srtm_vrt = rasterio.open(input_file_path)
+    logger.info(f"Loading \"{srtm_vrt.name}\" @ {srtm_vrt.width}x{srtm_vrt.height}")
+
+    sql = 'SELECT DISTINCT grid_id FROM "phase2"."land_tiles"'
+    with engine.connect() as conn:
+        grid_ids = list(conn.execute(text(sql)))
+
+    # Unravel the list of tuples into a simple tuple.
+    grid_ids = list(zip(*grid_ids))[0]
+    # grid_ids = [255, 270]
 
     for grid_id in grid_ids:
         logger.info(f"Fetching grid {grid_id}")
 
-        with _get_polygons(input_file_path, grid_id).open() as src:
+        with _get_polygons(srtm_vrt, grid_id).open() as src:
             dst_profile["height"] = src.height
             dst_profile["width"] = src.width
             dst_profile["crs"] = src.crs
             dst_profile["transform"] = src.transform
 
-            with MemoryFile() as memfile:
-                with memfile.open(**dst_profile) as dst:
-                    _process(ctx, dst, src, threshold)
+            with rasterio.open(output_file_path / f"grid_{grid_id}.tif", "w", **dst_profile) as dst:
+                _process(ctx, dst, src, threshold)
 
-                with memfile.open() as dst:
-                    slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
-                    slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
+            # with MemoryFile() as memfile:
+            #     with memfile.open(**dst_profile) as dst:
+            #         _process(ctx, dst, src, threshold)
+
+                # with memfile.open() as dst:
+                #     slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
+                #     slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
 
             logger.info("Done")
+
+    srtm_vrt.close()
 
 
 def _init_moderngl():
@@ -106,10 +121,6 @@ def _init_moderngl():
 def _process(ctx: moderngl.Context, dst, src, threshold: float):
     # Get some basic input file info and use the largest texture size this GPU can deal with
     # to split the file into tiles.
-    # img_width = src.width
-    # img_height = src.height
-    # tile_width = max_tile_size + (2 * overlap)
-    # tile_height = max_tile_size + (2 * overlap)
     workgroups_x = (max_tile_size + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
     workgroups_y = (max_tile_size + compute_shader_workgroup_size - 1) // compute_shader_workgroup_size
     tiles_x = (src.width + max_tile_size - 1) // max_tile_size
@@ -124,9 +135,16 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
 
     logger.info(f"Writing {tiles_x}x{tiles_y} tiles")
 
-    for y0 in range(-overlap, src.width, max_tile_size - (overlap * 2)):
-        for x0 in range(-overlap, src.height, max_tile_size - (overlap * 2)):
-            logger.info(f"Processing tile {x0 // max_tile_size}:{y0 // max_tile_size}")
+    # Because maths is hard, we're keeping track of the currently processed tile the dumb way.
+    tx = 0
+    ty = 0
+
+    for y0 in range(-overlap, src.height, max_tile_size - (overlap * 2)):
+        tx = 0
+
+        for x0 in range(-overlap, src.width, max_tile_size - (overlap * 2)):
+            logger.info(f"Processing tile {tx}:{ty}")
+            tx += 1
 
             window = Window(x0, y0, max_tile_size, max_tile_size)
             src.read(1, window=window, out=cpu_buf, boundless=True, masked=True, fill_value=nodata)
@@ -195,6 +213,8 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             result = result[overlap:overlap + h, overlap:overlap + w]
             dst.write(result, 1, window=write_window)
 
+        ty += 1
+
 
 def _polygonize(mask_bool, transform, crs, min_area_m2):
     logger.info("Polygonizing")
@@ -215,51 +235,52 @@ def _polygonize(mask_bool, transform, crs, min_area_m2):
     return gdf
 
 
-def _get_polygons(input_file_path: Path, grid_id: int) -> MemoryFile:
-    sql = f'SELECT geom FROM "phase2"."land" WHERE grid_id=%(grid_id)s and subtype=%(subtype)s and class=%(class)s'
-    gdf_mask = gpd.read_postgis(sql, con=engine, geom_col="geom", params={"grid_id": grid_id, "subtype": "land", "class": "land"})
+def _get_polygons(src, grid_id: int) -> MemoryFile:
+    sql = f'SELECT geom FROM "phase2"."land_tiles" WHERE grid_id=%(grid_id)s'
+    gdf_mask = gpd.read_postgis(sql, con=engine, geom_col="geom", params={"grid_id": grid_id})
 
     bounds = gdf_mask.total_bounds
 
-    with rasterio.open(input_file_path) as src:
-        logger.info(f"Loading \"{src.name}\" @ {src.width}x{src.height}")
+    xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bounds
+    xres, yres = _suggest_resolution_from_src_window(src, gdf_mask.crs, bounds)
 
-        xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bounds
-        xres, yres = _suggest_resolution_from_src_window(src, gdf_mask.crs, bounds)
+    xmin_pad = xmin_3832 - overlap * xres
+    xmax_pad = xmax_3832 + overlap * xres
+    ymin_pad = ymin_3832 - overlap * yres
+    ymax_pad = ymax_3832 + overlap * yres
 
-        xmin_pad = xmin_3832 - overlap * xres
-        xmax_pad = xmax_3832 + overlap * xres
-        ymin_pad = ymin_3832 - overlap * yres
-        ymax_pad = ymax_3832 + overlap * yres
+    # Build the exact target grid
+    width  = max(1, int(math.ceil((xmax_pad - xmin_pad) / xres)))
+    height = max(1, int(math.ceil((ymax_pad - ymin_pad) / yres)))
+    dst_transform = from_origin(xmin_pad, ymax_pad, xres, yres)
 
-        # Build the exact target grid
-        width  = max(1, int(math.ceil((xmax_pad - xmin_pad) / xres)))
-        height = max(1, int(math.ceil((ymax_pad - ymin_pad) / yres)))
-        dst_transform = from_origin(xmin_pad, ymax_pad, xres, yres)
+    logger.info(f"Extracting SRTM data")
 
-        vrt = WarpedVRT(
-            src,
-            crs=gdf_mask.crs,
-            transform=dst_transform,
-            width=width,
-            height=height,
-            resampling=Resampling.bilinear,
-            src_nodata=src.nodata,
-            nodata=src.nodata,
-            dtype="float32",
-        )
+    vrt = WarpedVRT(
+        src,
+        crs=gdf_mask.crs,
+        transform=dst_transform,
+        width=width,
+        height=height,
+        resampling=Resampling.bilinear,
+        src_nodata=src.nodata,
+        nodata=src.nodata,
+        dtype="float32",
+    )
 
-        data = vrt.read(1)
+    data = vrt.read(1)
 
-        mask = geometry_mask(
-            geometries=gdf_mask.geometry,
-            out_shape=(height, width),
-            transform=dst_transform,
-            invert=False,  # False => mask=True outside the shapes
-            all_touched=True
-        )
+    logger.info(f"Masking SRTM data")
 
-        data[mask] = src.nodata
+    mask = geometry_mask(
+        geometries=gdf_mask.geometry,
+        out_shape=(height, width),
+        transform=dst_transform,
+        invert=False,  # False => mask=True outside the shapes
+        all_touched=True
+    )
+
+    data[mask] = src.nodata
 
     profile = vrt.profile
     profile["driver"] = "GTiff"
