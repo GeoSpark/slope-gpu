@@ -42,9 +42,6 @@ def calc_slope(input_file_path: Path, output_file_path: Path, threshold: float):
         "nodata": nodata,
     }
 
-    srtm_vrt = rasterio.open(input_file_path)
-    logger.info(f"Loading \"{srtm_vrt.name}\" @ {srtm_vrt.width}x{srtm_vrt.height}")
-
     sql = 'SELECT DISTINCT grid_id FROM "phase2"."land_tiles"'
     with engine.connect() as conn:
         grid_ids = list(conn.execute(text(sql)))
@@ -54,35 +51,38 @@ def calc_slope(input_file_path: Path, output_file_path: Path, threshold: float):
     # grid_ids = [30]
     logger.info(f"Processing {len(grid_ids)} grids")
 
-    for grid_id in grid_ids:
-        output_file_name = output_file_path / f"grid_{grid_id}.tif"
-        if output_file_name.exists():
-            logger.info(f"File {output_file_name} exists, skipping")
-            continue
+    with rasterio.open(input_file_path) as srtm_vrt:
+        logger.info(f"Loading \"{srtm_vrt.name}\" @ {srtm_vrt.width}x{srtm_vrt.height}")
 
-        logger.info(f"Fetching grid {grid_id}")
+        for grid_id in grid_ids:
+            output_file_name = output_file_path / f"grid_{grid_id}.tif"
+            if output_file_name.exists():
+                logger.info(f"File {output_file_name} exists, skipping")
+                continue
 
-        with _get_polygons(srtm_vrt, grid_id) as memfile:
-            with memfile.open() as src:
-                dst_profile["height"] = src.height
-                dst_profile["width"] = src.width
-                dst_profile["crs"] = src.crs
-                dst_profile["transform"] = src.transform
+            logger.info(f"Fetching grid {grid_id}")
 
-                with rasterio.open(output_file_name, "w", **dst_profile) as dst:
-                    _process(ctx, dst, src, threshold)
+            with _get_polygons(srtm_vrt, grid_id) as memfile:
+                with memfile.open() as src:
+                    dst_profile["height"] = src.height
+                    dst_profile["width"] = src.width
+                    dst_profile["crs"] = src.crs
+                    dst_profile["transform"] = src.transform
 
-                # with MemoryFile() as memfile:
-                #     with memfile.open(**dst_profile) as dst:
-                #         _process(ctx, dst, src, threshold)
-    
-                    # with memfile.open() as dst:
-                    #     slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
-                    #     slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
+                    with rasterio.open(output_file_name, "w", **dst_profile) as dst:
+                        _process(ctx, dst, src, threshold)
 
-                logger.info("Done")
+                    # with MemoryFile() as memfile:
+                    #     with memfile.open(**dst_profile) as dst:
+                    #         _process(ctx, dst, src, threshold)
 
-    srtm_vrt.close()
+                        # with memfile.open() as dst:
+                        #     slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
+                        #     slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
+
+                    logger.info("Done")
+
+    ctx.release()
 
 
 def _init_moderngl():
@@ -139,6 +139,7 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
     gpu_buf_a = ctx.texture((max_tile_size, max_tile_size), components=1, dtype='f4')
     gpu_buf_b = ctx.texture((max_tile_size, max_tile_size), components=1, dtype='f4')
     cpu_buf = np.full((max_tile_size, max_tile_size), nodata, dtype=np.float32)
+    cpu_out = np.empty((max_tile_size, max_tile_size), dtype=np.float32)
 
     logger.info(f"Writing {tiles_x}x{tiles_y} tiles")
 
@@ -165,7 +166,6 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             # Assumes no z-rotation.
             shaders["slope"]["texel_size"] = [abs(src.transform.a), abs(src.transform.e)]
             shaders["slope"].run(workgroups_x, workgroups_y, 1)
-            ctx.finish()
             ctx.memory_barrier()
             # ----------------
             logger.info(f"Thresholding slope <{threshold}%")
@@ -174,7 +174,6 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             gpu_buf_a.bind_to_image(1, read=False, write=True)
             shaders["threshold"]["threshold"] = threshold
             shaders["threshold"].run(workgroups_x, workgroups_y, 1)
-            ctx.finish()
             ctx.memory_barrier()
             # ----------------
             logger.info("Median filter")
@@ -182,7 +181,6 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             gpu_buf_a.bind_to_image(0, read=True, write=False)
             gpu_buf_b.bind_to_image(1, read=False, write=True)
             shaders["median_filter"].run(workgroups_x, workgroups_y, 1)
-            ctx.finish()
             ctx.memory_barrier()
             # ----------------
             logger.info("Closing (Dilation filter)")
@@ -190,7 +188,6 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             gpu_buf_b.bind_to_image(0, read=True, write=False)
             gpu_buf_a.bind_to_image(1, read=False, write=True)
             shaders["dilation_filter"].run(workgroups_x, workgroups_y, 1)
-            ctx.finish()
             ctx.memory_barrier()
             # ----------------
             logger.info("Closing (Erosion filter)")
@@ -198,7 +195,6 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             gpu_buf_a.bind_to_image(0, read=True, write=False)
             gpu_buf_b.bind_to_image(1, read=False, write=True)
             shaders["erosion_filter"].run(workgroups_x, workgroups_y, 1)
-            ctx.finish()
             ctx.memory_barrier()
             # ----------------
             logger.info("Masking zeros")
@@ -206,21 +202,24 @@ def _process(ctx: moderngl.Context, dst, src, threshold: float):
             gpu_buf_b.bind_to_image(0, read=True, write=False)
             gpu_buf_a.bind_to_image(1, read=False, write=True)
             shaders["mask_zeros"].run(workgroups_x, workgroups_y, 1)
-            ctx.finish()
             ctx.memory_barrier()
             # ----------------
 
+            ctx.finish()
             logger.info(f"Storing result")
-            result = np.frombuffer(gpu_buf_a.read(), dtype=np.float32).reshape((max_tile_size, max_tile_size))
+            gpu_buf_a.read_into(cpu_out)
             x = x0 + overlap
             y = y0 + overlap
             w = min(max_tile_size - overlap, src.width - x)
             h = min(max_tile_size - overlap, src.height - y)
             write_window = Window(x, y, w, h)
-            result = result[overlap:overlap + h, overlap:overlap + w]
+            result = cpu_out[overlap:overlap + h, overlap:overlap + w]
             dst.write(result, 1, window=write_window)
 
         ty += 1
+
+    gpu_buf_a.release()
+    gpu_buf_b.release()
 
 
 def _polygonize(mask_bool, transform, crs, min_area_m2):
@@ -264,7 +263,7 @@ def _get_polygons(src, grid_id: int) -> MemoryFile:
 
     logger.info(f"Extracting SRTM data")
 
-    vrt = WarpedVRT(
+    with WarpedVRT(
         src,
         crs=gdf_mask.crs,
         transform=dst_transform,
@@ -274,9 +273,9 @@ def _get_polygons(src, grid_id: int) -> MemoryFile:
         src_nodata=src.nodata,
         nodata=src.nodata,
         dtype="float32",
-    )
-
-    data = vrt.read(1)
+    ) as vrt:
+        profile = vrt.profile
+        data = vrt.read(1)
 
     logger.info(f"Masking SRTM data")
 
@@ -290,7 +289,6 @@ def _get_polygons(src, grid_id: int) -> MemoryFile:
 
     data[mask] = src.nodata
 
-    profile = vrt.profile
     profile["driver"] = "GTiff"
     profile["tiled"] = True
     profile["blockxsize"] = 256
@@ -300,7 +298,7 @@ def _get_polygons(src, grid_id: int) -> MemoryFile:
     with masked_data.open(**profile) as memfile:
         memfile.write(data, 1)
 
-    vrt.close()
+    del data, mask, gdf_mask
 
     return masked_data
 
