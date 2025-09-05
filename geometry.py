@@ -51,29 +51,36 @@ def calc_slope(input_file_path: Path, output_file_path: Path, threshold: float):
 
     # Unravel the list of tuples into a simple tuple.
     grid_ids = list(zip(*grid_ids))[0]
-    # grid_ids = [255, 270]
+    # grid_ids = [30]
+    logger.info(f"Processing {len(grid_ids)} grids")
 
     for grid_id in grid_ids:
+        output_file_name = output_file_path / f"grid_{grid_id}.tif"
+        if output_file_name.exists():
+            logger.info(f"File {output_file_name} exists, skipping")
+            continue
+
         logger.info(f"Fetching grid {grid_id}")
 
-        with _get_polygons(srtm_vrt, grid_id).open() as src:
-            dst_profile["height"] = src.height
-            dst_profile["width"] = src.width
-            dst_profile["crs"] = src.crs
-            dst_profile["transform"] = src.transform
+        with _get_polygons(srtm_vrt, grid_id) as memfile:
+            with memfile.open() as src:
+                dst_profile["height"] = src.height
+                dst_profile["width"] = src.width
+                dst_profile["crs"] = src.crs
+                dst_profile["transform"] = src.transform
 
-            with rasterio.open(output_file_path / f"grid_{grid_id}.tif", "w", **dst_profile) as dst:
-                _process(ctx, dst, src, threshold)
+                with rasterio.open(output_file_name, "w", **dst_profile) as dst:
+                    _process(ctx, dst, src, threshold)
 
-            # with MemoryFile() as memfile:
-            #     with memfile.open(**dst_profile) as dst:
-            #         _process(ctx, dst, src, threshold)
+                # with MemoryFile() as memfile:
+                #     with memfile.open(**dst_profile) as dst:
+                #         _process(ctx, dst, src, threshold)
+    
+                    # with memfile.open() as dst:
+                    #     slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
+                    #     slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
 
-                # with memfile.open() as dst:
-                #     slope_polygons = _polygonize(dst.read(1), dst.transform, src.crs, 90)
-                #     slope_polygons.to_file(output_file_path / f"grid_{grid_id}.gpkg", driver="GPKG")
-
-            logger.info("Done")
+                logger.info("Done")
 
     srtm_vrt.close()
 
@@ -242,7 +249,8 @@ def _get_polygons(src, grid_id: int) -> MemoryFile:
     bounds = gdf_mask.total_bounds
 
     xmin_3832, ymin_3832, xmax_3832, ymax_3832 = bounds
-    xres, yres = _suggest_resolution_from_src_window(src, gdf_mask.crs, bounds)
+    # Bitten by the antimeridian issue :(
+    xres, yres = 30.0, 30.0  # _suggest_resolution_from_src_window(src, gdf_mask.crs, bounds)
 
     xmin_pad = xmin_3832 - overlap * xres
     xmax_pad = xmax_3832 + overlap * xres
@@ -291,6 +299,8 @@ def _get_polygons(src, grid_id: int) -> MemoryFile:
     masked_data = MemoryFile()
     with masked_data.open(**profile) as memfile:
         memfile.write(data, 1)
+
+    vrt.close()
 
     return masked_data
 
